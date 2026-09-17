@@ -48,6 +48,7 @@ impl std::error::Error for PacketProcessError {}
 /// so the transport handlers do not re-parse it.
 struct WorkerPacket {
     data: Vec<u8>,
+    len: usize,
     parsed: ParsedIpPacket,
 }
 
@@ -80,22 +81,35 @@ impl PacketProcessor {
         )?);
         let tun_packet_tx = TunPacketTx::new(tun_writer);
 
-        let tcp_handler = Arc::new(TcpHandler::new(
+        let mut tcp_handler = TcpHandler::new(
             config.clone(),
             socks5_client.clone(),
             outbound_interface_arc.clone(),
             tun_packet_tx.clone(),
             enable_user_space_process_exclusion,
-        ));
+        );
 
-        let udp_handler = Arc::new(UdpHandler::new(
+        let mut udp_handler = UdpHandler::new(
             config.clone(),
             socks5_client.clone(),
             dns_router.clone(),
             outbound_interface_arc.clone(),
             tun_packet_tx.clone(),
             enable_user_space_process_exclusion,
-        ));
+        );
+
+        // Share exclusion-cache and dynamic-bypass state between TCP and UDP so
+        // both protocols reuse process lookup results and route cleanup observes
+        // the full combined bypass set.
+        let shared_process_name_cache = Arc::new(dashmap::DashMap::new());
+        let shared_dynamic_bypass_ips = Arc::new(dashmap::DashMap::new());
+        tcp_handler.process_name_cache = shared_process_name_cache.clone();
+        udp_handler.process_name_cache = shared_process_name_cache;
+        tcp_handler.dynamic_bypass_ips = shared_dynamic_bypass_ips.clone();
+        udp_handler.dynamic_bypass_ips = shared_dynamic_bypass_ips;
+
+        let tcp_handler = Arc::new(tcp_handler);
+        let udp_handler = Arc::new(udp_handler);
 
         Ok(Self {
             config,
@@ -115,8 +129,7 @@ impl PacketProcessor {
 
     pub async fn process_packets(&self, tun_reader: Arc<tun_rs::AsyncDevice>) -> Result<()> {
         info!("Starting packet processing");
-
-        let mut buffer = vec![0; self.config.tun.mtu as usize];
+        let mtu = self.config.tun.mtu as usize;
 
         // Drive periodic maintenance with dedicated timers instead of
         // checking elapsed() on every packet in the hot path.
@@ -146,15 +159,31 @@ impl PacketProcessor {
             .unwrap_or(2)
             .max(2);
 
+        // Reader/worker recyclable packet-buffer pool.
+        // Reader checks out a Vec<u8>, fills it via TUN recv, sends it to a
+        // worker, and worker returns the Vec after processing.
+        let (recycle_tx, mut recycle_rx) =
+            mpsc::channel::<Vec<u8>>(worker_count * Self::WORKER_QUEUE_CAPACITY / 4);
+
         let mut worker_txs = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let (tx, mut rx) = mpsc::channel::<WorkerPacket>(Self::WORKER_QUEUE_CAPACITY);
             let processor = self.clone();
+            let recycle_tx = recycle_tx.clone();
             tokio::spawn(async move {
-                while let Some(task) = rx.recv().await {
-                    if let Err(e) = processor.process_packet(&task.data, &task.parsed).await {
+                while let Some(mut task) = rx.recv().await {
+                    if let Err(e) = processor
+                        .process_packet(&task.data[..task.len], &task.parsed)
+                        .await
+                    {
                         error!("Error processing packet: {}", e);
                     }
+
+                    // Restore buffer shape expected by TUN recv and recycle it.
+                    if task.data.len() != mtu {
+                        task.data.resize(mtu, 0);
+                    }
+                    let _ = recycle_tx.try_send(task.data);
                 }
             });
             worker_txs.push(tx);
@@ -182,26 +211,42 @@ impl PacketProcessor {
                     )
                     .await;
                 }
-                read_result = tun_reader.recv(&mut buffer) => {
-                    let bytes_read = read_result?;
+                read_result = async {
+                    let mut buffer = match recycle_rx.try_recv() {
+                        Ok(buf) => buf,
+                        Err(_) => vec![0; mtu],
+                    };
+                    if buffer.len() != mtu {
+                        buffer.resize(mtu, 0);
+                    }
+                    let bytes_read = tun_reader.recv(&mut buffer).await?;
+                    Ok::<(Vec<u8>, usize), anyhow::Error>((buffer, bytes_read))
+                } => {
+                    let (buffer, bytes_read) = read_result?;
 
                     if bytes_read == 0 {
+                        let _ = recycle_tx.try_send(buffer);
                         continue;
                     }
 
                     let packet = &buffer[..bytes_read];
                     let parsed = match Self::parse_ip_packet(packet) {
                         Ok(Some(p)) => p,
-                        Ok(None) => continue,
+                        Ok(None) => {
+                            let _ = recycle_tx.try_send(buffer);
+                            continue;
+                        }
                         Err(e) => {
                             error!("Error parsing packet: {}", e);
+                            let _ = recycle_tx.try_send(buffer);
                             continue;
                         }
                     };
 
                     let worker_idx = Self::packet_worker_index(&parsed, packet, worker_count);
                     let task = WorkerPacket {
-                        data: packet.to_vec(),
+                        data: buffer,
+                        len: bytes_read,
                         parsed,
                     };
 

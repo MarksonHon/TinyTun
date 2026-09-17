@@ -47,6 +47,23 @@ pub(crate) struct DirectUdpSessionEntry {
     _slot: Option<OwnedSemaphorePermit>,
 }
 
+struct PendingUdpSessionGuard {
+    pending: Arc<DashSet<UdpFlowKey>>,
+    flow_key: UdpFlowKey,
+}
+
+impl PendingUdpSessionGuard {
+    fn new(pending: Arc<DashSet<UdpFlowKey>>, flow_key: UdpFlowKey) -> Self {
+        Self { pending, flow_key }
+    }
+}
+
+impl Drop for PendingUdpSessionGuard {
+    fn drop(&mut self) {
+        self.pending.remove(&self.flow_key);
+    }
+}
+
 // ── UdpHandler ────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -418,6 +435,14 @@ impl UdpHandler {
         }
 
         // ── Slow path: no cached session yet, open a UDP ASSOCIATE. ────────
+        if !self.pending_udp_sessions.insert(udp_flow_key.clone()) {
+            debug!(
+                "UDP ASSOCIATE already in progress for {}:{} -> {}:{}",
+                ip_packet.src, source_port, ip_packet.dst, dest_port
+            );
+            return Ok(());
+        }
+
         let slot = match self.udp_session_slots.clone().try_acquire_owned() {
             Ok(slot) => slot,
             Err(_) => {
@@ -429,6 +454,7 @@ impl UdpHandler {
                 {
                     Ok(Ok(slot)) => slot,
                     Ok(Err(_)) => {
+                        self.pending_udp_sessions.remove(&udp_flow_key);
                         debug!(
                             "Dropping UDP packet (session slot error) {}:{} -> {}:{}",
                             ip_packet.src, source_port, ip_packet.dst, dest_port
@@ -436,6 +462,7 @@ impl UdpHandler {
                         return Ok(());
                     }
                     Err(_) => {
+                        self.pending_udp_sessions.remove(&udp_flow_key);
                         debug!(
                             "Dropping UDP packet (session limit, timed out waiting) {}:{} -> {}:{}",
                             ip_packet.src, source_port, ip_packet.dst, dest_port
@@ -455,21 +482,20 @@ impl UdpHandler {
         let dst_ip = ip_packet.dst;
 
         tokio::spawn(async move {
-            let pending_for_cleanup = pending_udp_sessions.clone();
+            let _pending_guard = PendingUdpSessionGuard::new(
+                pending_udp_sessions.clone(),
+                udp_flow_key.clone(),
+            );
 
             let session = match Self::open_udp_session_guarded(
                 socks5_client,
                 udp_sessions.clone(),
-                pending_udp_sessions,
                 udp_flow_key.clone(),
             )
             .await
             {
                 Ok(session) => session,
                 Err(err) => {
-                    // The future may have been cancelled before it could clear
-                    // its pending marker; sweep a stale entry if present.
-                    pending_for_cleanup.remove(&udp_flow_key);
                     Self::mark_udp_flow_backoff_shared(
                         udp_timeout_backoff.clone(),
                         udp_flow_key.clone(),
@@ -500,6 +526,7 @@ impl UdpHandler {
                 },
             );
 
+            drop(_pending_guard);
             Self::try_send_udp_frame(&session, udp_flow_key.dst, &udp_payload);
             debug!(
                 "Opened UDP ASSOCIATE for {}:{} -> {}:{} with {} bytes",
@@ -549,7 +576,6 @@ impl UdpHandler {
     async fn open_udp_session_guarded(
         socks5_client: Arc<Socks5Client>,
         udp_sessions: Arc<DashMap<UdpFlowKey, UdpSessionEntry>>,
-        pending_udp_sessions: Arc<DashSet<UdpFlowKey>>,
         flow_key: UdpFlowKey,
     ) -> Result<Arc<Socks5UdpSession>> {
         // A racing creation task may have won while this task waited for its
@@ -557,18 +583,7 @@ impl UdpHandler {
         if let Some(entry) = udp_sessions.get(&flow_key) {
             return Ok(entry.session.clone());
         }
-
-        let is_already_pending = !pending_udp_sessions.insert(flow_key.clone());
-        if is_already_pending {
-            return Err(anyhow::anyhow!(
-                "UDP ASSOCIATE already in progress for {} -> {}",
-                flow_key.src,
-                flow_key.dst
-            ));
-        }
-
         let result = socks5_client.open_udp_session(flow_key.dst).await;
-        pending_udp_sessions.remove(&flow_key);
         Ok(result.map(Arc::new)?)
     }
 

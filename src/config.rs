@@ -306,9 +306,17 @@ pub struct FilteringConfig {
     /// Fast O(1) lookup set for allow-listed ports.
     #[serde(skip)]
     pub(crate) allow_ports_set: HashSet<u16>,
+    /// Lowercased process basenames to exclude (runtime precompiled set).
+    #[serde(skip)]
+    pub(crate) exclude_process_basenames_set: HashSet<String>,
 }
 
 impl FilteringConfig {
+    #[inline]
+    fn process_basename(name: &str) -> &str {
+        name.rsplit(['/', '\\']).next().unwrap_or(name)
+    }
+
     #[inline]
     fn mask_ipv4(ip: u32, prefix: u8) -> u32 {
         if prefix == 0 {
@@ -333,6 +341,11 @@ impl FilteringConfig {
         self.skip_ips_set = self.skip_ips.iter().copied().collect();
         self.block_ports_set = self.block_ports.iter().copied().collect();
         self.allow_ports_set = self.allow_ports.iter().copied().collect();
+        self.exclude_process_basenames_set = self
+            .exclude_processes
+            .iter()
+            .map(|name| Self::process_basename(name).to_ascii_lowercase())
+            .collect();
         self.skip_networks_parsed = self
             .skip_networks
             .iter()
@@ -473,6 +486,7 @@ impl Default for FilteringConfig {
             skip_networks_v6_flat: Vec::new(),
             block_ports_set: HashSet::new(),
             allow_ports_set: HashSet::new(),
+            exclude_process_basenames_set: HashSet::new(),
         };
         cfg.finalize();
         cfg
@@ -575,13 +589,19 @@ impl Config {
     }
 
     pub fn is_excluded_process_name(&self, process_name: &str) -> bool {
-        let candidate = process_name
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(process_name);
+        let candidate = FilteringConfig::process_basename(process_name).to_ascii_lowercase();
+
+        if !self.filtering.exclude_process_basenames_set.is_empty() {
+            return self
+                .filtering
+                .exclude_process_basenames_set
+                .contains(&candidate);
+        }
+
+        // Compatibility fallback when caller mutates `exclude_processes`
+        // directly without rebuilding runtime indexes via `finalize()`.
         self.filtering.exclude_processes.iter().any(|excluded| {
-            let excluded_name = excluded.rsplit(['/', '\\']).next().unwrap_or(excluded);
-            excluded_name.eq_ignore_ascii_case(candidate)
+            FilteringConfig::process_basename(excluded).eq_ignore_ascii_case(&candidate)
         })
     }
 }

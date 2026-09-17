@@ -1184,9 +1184,10 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     // `QueryFullProcessImageNameW`. The returned handle is wrapped in `ProcessHandle`
     // to ensure it is closed on all paths. A null handle (failure) is handled by
     // `ProcessHandle::drop` which checks `is_invalid()`.
-    let handle = unsafe {
-        ProcessHandle::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).unwrap())
+    let raw_handle = unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?
     };
+    let handle = unsafe { ProcessHandle::new(raw_handle) };
     if handle.as_raw().is_invalid() {
         return None;
     }
@@ -1224,6 +1225,20 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
 /// All other platforms (Linux, macOS): resolve process name from PID via sysinfo.
 #[cfg(not(any(target_os = "freebsd", windows)))]
 fn process_name_from_pid(pid: u32) -> Option<String> {
+    static PROCESS_NAME_CACHE: std::sync::OnceLock<dashmap::DashMap<u32, (String, std::time::Instant)>> =
+        std::sync::OnceLock::new();
+    const PROCESS_NAME_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+    const PROCESS_NAME_CACHE_MAX_ENTRIES: usize = 4096;
+
+    let cache = PROCESS_NAME_CACHE.get_or_init(dashmap::DashMap::new);
+
+    if let Some(entry) = cache.get(&pid) {
+        let (name, recorded_at) = entry.value();
+        if recorded_at.elapsed() <= PROCESS_NAME_CACHE_TTL {
+            return Some(name.clone());
+        }
+    }
+
     let mut sys = System::new_with_specifics(
         RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
     );
@@ -1238,6 +1253,16 @@ fn process_name_from_pid(pid: u32) -> Option<String> {
     if name.is_empty() {
         None
     } else {
-        Some(name.to_string())
+        let owned = name.to_string();
+        cache.insert(pid, (owned.clone(), std::time::Instant::now()));
+
+        if cache.len() > PROCESS_NAME_CACHE_MAX_ENTRIES {
+            let now = std::time::Instant::now();
+            cache.retain(|_, (_, recorded_at)| {
+                now.duration_since(*recorded_at) <= PROCESS_NAME_CACHE_TTL
+            });
+        }
+
+        Some(owned)
     }
 }
